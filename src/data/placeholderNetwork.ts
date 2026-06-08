@@ -770,6 +770,18 @@ function buildPlaceholderSubscribers(): Subscriber[] {
       mode: 'sa',
     }
   }
+  /** A handful of extra VIPs for “All” views — promote existing rows, not a higher global VIP rate. */
+  const extraVipCount = 3 + (mix32(0xc001d00d) % 6)
+  const promoted = new Set<number>()
+  let probe = 0
+  while (promoted.size < extraVipCount && probe < out.length * 6) {
+    const idx = mix32(probe * 0x9e3779b9 + out.length) % out.length
+    probe += 1
+    const row = out[idx]
+    if (row.imsi === VIP_HIGHWAY_IMSI || row.segment === 'vip' || promoted.has(idx)) continue
+    promoted.add(idx)
+    out[idx] = { ...row, segment: 'vip' }
+  }
   return out
 }
 
@@ -805,10 +817,12 @@ export function applyGlobalSubscriberFilters(
     f.selectedRegionIds ?? [],
     f.selectedPostcodeAreaIds ?? [],
   )
+  const subscriberType =
+    typeof f.subscriberType === 'string' ? f.subscriberType.trim().toLowerCase() : 'all'
   return subs.filter((s) => {
     if (f.service !== 'all' && s.service !== f.service) return false
     if (f.networkMode !== 'all' && s.mode !== f.networkMode) return false
-    if (f.subscriberType !== 'all' && s.segment !== f.subscriberType) return false
+    if (subscriberType !== 'all' && s.segment !== subscriberType) return false
     if (geoCells !== null && !geoCells.has(s.cellId)) return false
     return true
   })
@@ -1115,6 +1129,38 @@ export function sortSubscribersByKpi(rows: Subscriber[], kpiId: KpiId): Subscrib
     return direction === 'higher_is_better' ? av - bv : bv - av
   })
   return copy
+}
+
+/**
+ * When subscriber type is "all", strict KPI-only sort often stacks one segment at the top
+ * (e.g. synthetic VIPs skew worse). Interleave worst-first queues per segment for a visible mix.
+ */
+export function sortSubscribersByKpiMixedSegments(rows: Subscriber[], kpiId: KpiId): Subscriber[] {
+  const order: SubscriberSegment[] = ['consumer', 'enterprise', 'iot', 'vip']
+  const bySeg = new Map<SubscriberSegment, Subscriber[]>()
+  for (const seg of order) bySeg.set(seg, [])
+  for (const s of rows) {
+    const list = bySeg.get(s.segment)
+    if (list) list.push(s)
+  }
+  const direction = kpiDefinition(kpiId).direction
+  for (const seg of order) {
+    const arr = bySeg.get(seg)!
+    arr.sort((a, b) => {
+      const av = subscriberKpiValue(a, kpiId)
+      const bv = subscriberKpiValue(b, kpiId)
+      return direction === 'higher_is_better' ? av - bv : bv - av
+    })
+  }
+  const maxLen = Math.max(0, ...order.map((seg) => bySeg.get(seg)!.length))
+  const out: Subscriber[] = []
+  for (let i = 0; i < maxLen; i += 1) {
+    for (const seg of order) {
+      const arr = bySeg.get(seg)!
+      if (i < arr.length) out.push(arr[i])
+    }
+  }
+  return out
 }
 
 /**
@@ -1960,5 +2006,281 @@ export function computePeriodBKpiValueByKpi(
   }
   return Math.max(0, valueA * (1 + delta))
 }
+
+/** Impact-type lens for the operator impact view (subset of KPI categories). */
+export type ImpactType = 'Connectivity' | 'Reliability' | 'Signal' | 'Throughput'
+
+/** Impact ranking lens: one pillar, or union across all four. */
+export type ImpactRankingLens = ImpactType | 'All'
+
+export const IMPACT_TYPE_DEFAULT_KPI: Record<ImpactType, KpiId> = {
+  Connectivity: 'connectivity_attach_success_pct',
+  Reliability: 'reliability_rlf_count',
+  Signal: 'signal_rsrp',
+  Throughput: 'throughput_dl_mbps',
+}
+
+/** Canonical order for multi-pillar impact ranking / map logic. */
+export const IMPACT_TYPES_ORDER: readonly ImpactType[] = [
+  'Connectivity',
+  'Reliability',
+  'Signal',
+  'Throughput',
+] as const
+
+export function impactTypeFromKpiId(kpiId: KpiId): ImpactType | null {
+  const cat = KPI_BY_ID[kpiId].category
+  if (cat === 'Connectivity' || cat === 'Reliability' || cat === 'Signal' || cat === 'Throughput') return cat
+  return null
+}
+
+export function subscriberImpactedByImpactType(s: Subscriber, impact: ImpactRankingLens): boolean {
+  if (impact === 'All') {
+    return (
+      s.setupAccessFailures > 0 ||
+      s.callDrops >= 1 ||
+      s.hoSuccessPct < 93.5 ||
+      kpiBand('signal_rsrp', subscriberKpiValue(s, 'signal_rsrp')) !== 'meetsTarget' ||
+      kpiBand('throughput_dl_mbps', subscriberKpiValue(s, 'throughput_dl_mbps')) !== 'meetsTarget'
+    )
+  }
+  switch (impact) {
+    case 'Connectivity':
+      return s.setupAccessFailures > 0
+    case 'Reliability':
+      return s.callDrops >= 1 || s.hoSuccessPct < 93.5 || s.setupAccessFailures >= 2
+    case 'Signal':
+      return kpiBand('signal_rsrp', subscriberKpiValue(s, 'signal_rsrp')) !== 'meetsTarget'
+    case 'Throughput':
+      return kpiBand('throughput_dl_mbps', subscriberKpiValue(s, 'throughput_dl_mbps')) !== 'meetsTarget'
+    default:
+      return false
+  }
+}
+
+export function cellEnvironmentLabel(cell: Cell): 'Urban' | 'Suburban' | 'Rural' {
+  const n = cell.id.split('').reduce((acc, ch) => acc + ch.charCodeAt(0), 0)
+  const mod = n % 3
+  if (mod === 0) return 'Urban'
+  if (mod === 1) return 'Suburban'
+  return 'Rural'
+}
+
+export type CellImpactRankingFlags = {
+  /** Meaningful VIP concentration in the filtered footprint (hidden when the view is already VIP-only). */
+  vip: boolean
+  /** Cell-aggregated connectivity KPIs off target (attach / NR RRC). */
+  issueConnectivity: boolean
+  /** Cell-aggregated reliability KPIs off target (RLF, HO, X2/Xn). */
+  issueReliability: boolean
+  /** Cell-aggregated RF / quality KPIs off target. */
+  issueSignal: boolean
+  /** Cell-aggregated throughput KPIs off target. */
+  issueThroughput: boolean
+}
+
+function bandSeverity(kpiId: KpiId, value: number): number {
+  const b = kpiBand(kpiId, value)
+  if (b === 'breached') return 2
+  if (b === 'nearBreach') return 1
+  return 0
+}
+
+const PILLAR_ORDER = [
+  'issueConnectivity',
+  'issueReliability',
+  'issueSignal',
+  'issueThroughput',
+] as const
+
+function pillarTieOrder(cellId: string, pillar: (typeof PILLAR_ORDER)[number]): number {
+  let h = 0
+  for (let i = 0; i < cellId.length; i += 1) {
+    h = (h * 31 + cellId.charCodeAt(i)) >>> 0
+  }
+  const p = PILLAR_ORDER.indexOf(pillar)
+  return (h ^ (p * 0x9e3779b1)) >>> 0
+}
+
+function flagsFromPillarScores(
+  pillarScores: Record<(typeof PILLAR_ORDER)[number], number>,
+  cellId: string,
+): Pick<
+  CellImpactRankingFlags,
+  'issueConnectivity' | 'issueReliability' | 'issueSignal' | 'issueThroughput'
+> {
+  const active = PILLAR_ORDER.filter((k) => pillarScores[k] >= 1)
+  active.sort((a, b) => {
+    const d = pillarScores[b] - pillarScores[a]
+    if (d !== 0) return d
+    const tie = pillarTieOrder(cellId, a) - pillarTieOrder(cellId, b)
+    if (tie !== 0) return tie
+    return PILLAR_ORDER.indexOf(a) - PILLAR_ORDER.indexOf(b)
+  })
+  const shown = new Set(active.slice(0, 3))
+  return {
+    issueConnectivity: shown.has('issueConnectivity'),
+    issueReliability: shown.has('issueReliability'),
+    issueSignal: shown.has('issueSignal'),
+    issueThroughput: shown.has('issueThroughput'),
+  }
+}
+
+/** Per-subscriber 0–2 severity per pillar (same bands as cell aggregates, at subscriber grain). */
+function subscriberPillarScoresRow(s: Subscriber): Record<(typeof PILLAR_ORDER)[number], number> {
+  return {
+    issueConnectivity: Math.max(
+      bandSeverity('connectivity_attach_success_pct', subscriberKpiValue(s, 'connectivity_attach_success_pct')),
+      bandSeverity(
+        'connectivity_nr_rrc_setup_success_pct',
+        subscriberKpiValue(s, 'connectivity_nr_rrc_setup_success_pct'),
+      ),
+    ),
+    issueReliability: Math.max(
+      bandSeverity('reliability_rlf_count', subscriberKpiValue(s, 'reliability_rlf_count')),
+      bandSeverity('reliability_5g_ho_success_pct', subscriberKpiValue(s, 'reliability_5g_ho_success_pct')),
+      bandSeverity(
+        'reliability_x2_xn1_setup_success_pct',
+        subscriberKpiValue(s, 'reliability_x2_xn1_setup_success_pct'),
+      ),
+    ),
+    issueSignal: Math.max(
+      bandSeverity('signal_rsrp', subscriberKpiValue(s, 'signal_rsrp')),
+      bandSeverity('signal_rsrq', subscriberKpiValue(s, 'signal_rsrq')),
+      bandSeverity('signal_bler', subscriberKpiValue(s, 'signal_bler')),
+    ),
+    issueThroughput: Math.max(
+      bandSeverity('throughput_dl_mbps', subscriberKpiValue(s, 'throughput_dl_mbps')),
+      bandSeverity('throughput_ul_mbps', subscriberKpiValue(s, 'throughput_ul_mbps')),
+    ),
+  }
+}
+
+const TRAIL_BLEND_WINDOW = 220
+
+/** Stable slice of a large cohort so impact-ranking trail math stays fast but varies by cell. */
+function subsWindowForTrailBlend(subs: Subscriber[], cellId: string): Subscriber[] {
+  if (subs.length <= TRAIL_BLEND_WINDOW) return subs
+  const span = subs.length - TRAIL_BLEND_WINDOW
+  const off = span > 0 ? cellIdSalt(cellId) % (span + 1) : 0
+  return subs.slice(off, off + TRAIL_BLEND_WINDOW)
+}
+
+function pillarScoreSumsFromSubscribers(windowed: Subscriber[]): Record<(typeof PILLAR_ORDER)[number], number> {
+  const sums: Record<(typeof PILLAR_ORDER)[number], number> = {
+    issueConnectivity: 0,
+    issueReliability: 0,
+    issueSignal: 0,
+    issueThroughput: 0,
+  }
+  for (const s of windowed) {
+    const row = subscriberPillarScoresRow(s)
+    for (const k of PILLAR_ORDER) {
+      sums[k] += row[k]
+    }
+  }
+  return sums
+}
+
+/** Breaks ties so nearby cells do not always show the same three trail icons. */
+function applyPerCellPillarJitter(
+  sums: Record<(typeof PILLAR_ORDER)[number], number>,
+  cellId: string,
+): Record<(typeof PILLAR_ORDER)[number], number> {
+  const salt = cellIdSalt(cellId)
+  const max = Math.max(...PILLAR_ORDER.map((k) => sums[k]), 0)
+  const scale = Math.max(6, Math.min(28, Math.floor(max * 0.06) + 6))
+  const out = { ...sums }
+  let i = 0
+  for (const k of PILLAR_ORDER) {
+    const j = ((salt >>> (i * 3)) ^ (salt * 31 + i * 0x85ebca6b)) >>> 0
+    out[k] += (j % (2 * scale + 1)) - scale
+    i += 1
+  }
+  return out
+}
+
+/** Per-subscriber stress flags for subscriber tables (VIP + up to three co-stress pillars). */
+export function subscriberIssueTrailFlags(
+  subscriber: Subscriber,
+  f: SubscriberGlobalFilters,
+): CellImpactRankingFlags {
+  const subscriberType =
+    typeof f.subscriberType === 'string' ? f.subscriberType.trim().toLowerCase() : 'all'
+  const vip = subscriberType !== 'vip' && subscriber.segment === 'vip'
+
+  const pillarScores = subscriberPillarScoresRow(subscriber)
+  return {
+    vip,
+    ...flagsFromPillarScores(pillarScores, subscriber.imsi),
+  }
+}
+
+/**
+ * Trail chips for impact ranking **cell** rows: pillar stress is summed over subscribers **impacted for
+ * the selected impact type** (when enough of them appear in the footprint window), otherwise the
+ * full window — so rows diverge. A small deterministic jitter breaks residual ties. VIP uses the
+ * footprint window as before.
+ */
+export function cellImpactRankingTrailFlags(
+  cell: Cell,
+  f: SubscriberGlobalFilters,
+  impact: ImpactRankingLens,
+): CellImpactRankingFlags {
+  const raw = subscribersForFootprint(cell.id)
+  const subs = applyGlobalSubscriberFilters(raw, f)
+  if (!subs.length) {
+    return {
+      vip: false,
+      issueConnectivity: false,
+      issueReliability: false,
+      issueSignal: false,
+      issueThroughput: false,
+    }
+  }
+
+  const subscriberType =
+    typeof f.subscriberType === 'string' ? f.subscriberType.trim().toLowerCase() : 'all'
+  const windowed = subsWindowForTrailBlend(subs, cell.id)
+  const vipInWindow = windowed.reduce((n, s) => n + (s.segment === 'vip' ? 1 : 0), 0)
+  const vipShareWindow = windowed.length ? vipInWindow / windowed.length : 0
+  /** Slightly above baseline VIP density in this slice; keeps chips sparse vs “every row”. */
+  const vip =
+    subscriberType !== 'vip' &&
+    vipInWindow >= 4 &&
+    (vipShareWindow >= 0.055 || (vipShareWindow >= 0.048 && vipInWindow >= 10))
+
+  const impactedInWindow = windowed.filter((s) => subscriberImpactedByImpactType(s, impact))
+  const cohort = impactedInWindow.length >= 16 ? impactedInWindow : windowed
+  const rawSums = pillarScoreSumsFromSubscribers(cohort)
+  const pillarScores = applyPerCellPillarJitter(rawSums, cell.id)
+
+  return {
+    vip,
+    ...flagsFromPillarScores(pillarScores, cell.id),
+  }
+}
+
+export function cellImpactSubscriberCounts(
+  cell: Cell,
+  f: SubscriberGlobalFilters,
+  impact: ImpactRankingLens,
+): { affected: number; total: number; fromAnchors: boolean } {
+  const raw = subscribersForFootprint(cell.id)
+  if (!raw.length) {
+    return { affected: 0, total: 0, fromAnchors: false }
+  }
+  const subs = applyGlobalSubscriberFilters(raw, f)
+  if (!subs.length) {
+    return { affected: 0, total: 0, fromAnchors: true }
+  }
+  const affected = subs.filter((s) => subscriberImpactedByImpactType(s, impact)).length
+  return { affected, total: subs.length, fromAnchors: true }
+}
+
+/** Back-compat names after impact-ranking rename (avoid churn in UI imports). */
+export type LeaderboardImpactLens = ImpactRankingLens
+export type CellLeaderboardFlags = CellImpactRankingFlags
+export const cellLeaderboardTrailFlags = cellImpactRankingTrailFlags
 
 export type { SubscriberGlobalFilters } from '../utils/filterPresets'

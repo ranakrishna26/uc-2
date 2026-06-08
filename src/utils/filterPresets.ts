@@ -129,9 +129,11 @@ function normalizeSnapshot(x: unknown): GlobalFilterSnapshot | null {
       ? x.networkMode
       : 'sa'
   const timeRange = typeof x.timeRange === 'string' ? x.timeRange : null
-  const subscriberType = typeof x.subscriberType === 'string' ? x.subscriberType : null
+  const subscriberTypeRaw = typeof x.subscriberType === 'string' ? x.subscriberType : ''
+  const trimmed = subscriberTypeRaw.trim()
+  const subscriberType = !trimmed || trimmed.toLowerCase() === 'all' ? 'all' : trimmed.toLowerCase()
   const cellAttributes = typeof x.cellAttributes === 'string' ? x.cellAttributes : null
-  if (!timeRange || !subscriberType || cellAttributes === null) return null
+  if (!timeRange || cellAttributes === null) return null
   const selectedKpiId = isKpiId(x.selectedKpiId) ? x.selectedKpiId : DEFAULT_KPI_ID
 
   let selectedRegionIds = normalizeRegionSelection(x.selectedRegionIds)

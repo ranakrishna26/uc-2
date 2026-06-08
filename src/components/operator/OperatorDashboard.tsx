@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Area,
   Bar,
@@ -16,10 +16,16 @@ import {
   YAxis,
 } from 'recharts'
 import {
+  CELLS,
+  IMPACT_TYPE_DEFAULT_KPI,
+  IMPACT_TYPES_ORDER,
   SUBSCRIBERS,
   applyGlobalSubscriberFilters,
   cellById,
+  cellEnvironmentLabel,
+  cellImpactSubscriberCounts,
   cellKpiValue,
+  cellLeaderboardTrailFlags,
   comparePeriodBLabel,
   computePeriodBKpiValueByKpi,
   formatKpiValue,
@@ -27,18 +33,26 @@ import {
   formatSessionStartLocal,
   getSessions,
   globalTimeRangeLabel,
+  impactTypeFromKpiId,
   rankedCellsByKpi,
   sessionKpiValue,
   sortSubscribersByKpi,
+  sortSubscribersByKpiMixedSegments,
   subscriberKpiValue,
-  subscribersForFootprint,
   type ComparePeriodOption,
-  type Cell as NetworkCell,
+  type ImpactType,
+  type LeaderboardImpactLens,
   type Subscriber as NetworkSubscriber,
   type SubscriberDevice,
   type SubscriberGlobalFilters,
 } from '../../data/placeholderNetwork'
 import { GlobalFiltersBar } from './GlobalFiltersBar'
+import { AiChatDock, type AiChatDockHandle } from './AiChatDock'
+import {
+  ImpactLeaderboard,
+  type ImpactLeaderboardAiExplainDetail,
+  type LeaderboardListMode,
+} from './ImpactLeaderboard'
 import { OperatorMap } from './OperatorMap'
 import {
   DEFAULT_GLOBAL_FILTER_SNAPSHOT,
@@ -61,12 +75,11 @@ import {
   type KpiId,
 } from '../../data/kpis'
 import { DashboardTopHeader } from './DashboardTopHeader'
+import { buildImpactRowExplainUserText } from './impactRowExplain'
+import { RowInsightCard } from './RowInsightCard'
+import { fetchMapCellInsight } from './mapCellInsight'
 
-type View = 'cells' | 'subscribers' | 'sessions'
-
-const CELL_FOCUS_TREND_BUCKETS = 48
-const CELL_FOCUS_SCATTER_MAX_POINTS = 320
-const CELL_FOCUS_COMPARISON_MAX_SESSIONS = 2500
+type View = 'cells' | 'sessions'
 
 type SessionPoint = ReturnType<typeof getSessions>[number]
 
@@ -96,24 +109,6 @@ type TrendDatum = {
   isAggregated: boolean
 }
 
-function deterministicSample<T>(items: T[], maxItems: number): T[] {
-  if (items.length <= maxItems || maxItems <= 0) return items
-  if (maxItems === 1) return [items[0]]
-  const result: T[] = []
-  for (let i = 0; i < maxItems; i += 1) {
-    const idx = Math.floor((i * (items.length - 1)) / (maxItems - 1))
-    result.push(items[idx])
-  }
-  return result
-}
-
-function percentileFromSorted(values: number[], percentile: number): number {
-  if (!values.length) return 0
-  const clamped = Math.min(Math.max(percentile, 0), 1)
-  const idx = Math.floor(clamped * (values.length - 1))
-  return values[idx]
-}
-
 function distributionBinIndex(value: number, bins: KpiDistributionBin[]): number {
   for (let i = 0; i < bins.length; i += 1) {
     const bin = bins[i]
@@ -138,111 +133,10 @@ function distributionStats(values: number[], bins: KpiDistributionBin[]) {
   })
 }
 
-function bucketSessionsForTrend(sessions: SessionPoint[], targetBuckets: number) {
-  if (!sessions.length) return []
-  const bucketCount = Math.max(1, Math.min(targetBuckets, sessions.length))
-  const buckets: {
-    i: number
-    avgThroughput: number
-    p10Throughput: number
-    p90Throughput: number
-    lowThroughput: number
-    highThroughput: number
-    bucketSize: number
-    cellCount: number
-  }[] = []
-  for (let bucketIdx = 0; bucketIdx < bucketCount; bucketIdx += 1) {
-    const start = Math.floor((bucketIdx * sessions.length) / bucketCount)
-    const end = Math.floor(((bucketIdx + 1) * sessions.length) / bucketCount)
-    const slice = sessions.slice(start, end)
-    if (!slice.length) continue
-    const throughput = slice.map((session) => session.throughputMbps)
-    const sorted = [...throughput].sort((a, b) => a - b)
-    const total = throughput.reduce((sum, value) => sum + value, 0)
-    buckets.push({
-      i: buckets.length,
-      avgThroughput: total / throughput.length,
-      p10Throughput: percentileFromSorted(sorted, 0.1),
-      p90Throughput: percentileFromSorted(sorted, 0.9),
-      lowThroughput: sorted[0],
-      highThroughput: sorted[sorted.length - 1],
-      bucketSize: slice.length,
-      cellCount: new Set(slice.map((session) => session.cellId)).size,
-    })
-  }
-  return buckets
-}
-
 function matchImsi(q: string, imsi: string): boolean {
   const n = q.replace(/\s/g, '').toLowerCase()
   if (!n) return true
   return imsi.replace(/\s/g, '').toLowerCase().includes(n)
-}
-
-function CellDetailsPanel({
-  cell,
-  showTitle = true,
-}: {
-  cell: NetworkCell
-  /** When false, only the fact grid (e.g. under breadcrumb that already shows Cell: id). */
-  showTitle?: boolean
-}) {
-  const grid = (
-    <div
-      className="cell-details-grid"
-      role="group"
-      aria-label={showTitle ? `Details for ${cell.name}` : `Cell profile and RF details for ${cell.name}`}
-    >
-      <span>
-        <strong>Cell ID</strong>: {cell.id}
-      </span>
-      <span>
-        <strong>Site</strong>: {cell.siteCode}
-      </span>
-      <span>
-        <strong>Sector</strong>: {cell.sector}
-      </span>
-      <span>
-        <strong>Azimuth</strong>: {cell.azimuthDeg} deg
-      </span>
-      <span>
-        <strong>PCI</strong>: {cell.pci}
-      </span>
-      <span>
-        <strong>NR-ARFCN</strong>: {cell.nrArfcn}
-      </span>
-      <span>
-        <strong>Band / BW</strong>: {cell.band} / {cell.bandwidthMhz} MHz
-      </span>
-      <span>
-        <strong>TAC</strong>: {cell.tac}
-      </span>
-      <span>
-        <strong>Antenna</strong>: {cell.antennaHeightM} m, tilt {cell.electricalTiltDeg} deg
-      </span>
-      <span>
-        <strong>Vendor</strong>: {cell.vendor}
-      </span>
-      <span>
-        <strong>Neighbors</strong>: {cell.neighborIds.length}
-      </span>
-    </div>
-  )
-
-  if (!showTitle) {
-    return grid
-  }
-
-  return (
-    <section className="cell-details-panel" aria-labelledby={`cell-details-h-${cell.id}`}>
-      <h3 className="cell-details-panel__title" id={`cell-details-h-${cell.id}`}>
-        <span className="cell-details-panel__title-label">Cell:</span>
-        <span>{cell.name}</span>
-        <span className="mono cell-details-panel__title-id">({cell.id})</span>
-      </h3>
-      {grid}
-    </section>
-  )
 }
 
 function subscriberDeviceLabel(device: SubscriberDevice): string {
@@ -335,77 +229,27 @@ function SubscriberDetailsPanel({
   )
 }
 
-function TableNavBreadcrumb({
-  view,
-  selectedCellId,
+function SessionTableBreadcrumb({
   selectedImsi,
-  subscriberListTabLabel,
-  subscriberListCellName,
-  onToCells,
-  onToSubscribers,
+  onBackToCells,
 }: {
-  view: 'subscribers' | 'sessions'
-  selectedCellId: string | null
-  selectedImsi: string | null
-  /** Active cells table tab when opening subscriber list from a cell (e.g. "Call drop"). */
-  subscriberListTabLabel?: string
-  /** Display name of the cell when in subscriber list for that cell. */
-  subscriberListCellName?: string | null
-  onToCells: () => void
-  onToSubscribers: () => void
+  selectedImsi: string
+  onBackToCells: () => void
 }) {
-  const cellIdShort = selectedCellId ?? ''
-
-  if (view === 'sessions') {
-    const goBack = selectedCellId ? onToSubscribers : onToCells
-    const backLabel = selectedCellId ? 'Back to subscriber list' : 'Back to cell list'
-    return (
-      <nav className="table-breadcrumb table-breadcrumb--compact" aria-label="Subscriber context">
-        <ol className="table-breadcrumb-list">
-          <li className="table-breadcrumb-item">
-            <button type="button" className="table-breadcrumb-back" onClick={goBack} aria-label={backLabel}>
-              ←
-            </button>
-          </li>
-          <li className="table-breadcrumb-item">
-            <span className="table-breadcrumb-current" aria-current="page">
-              <span className="table-breadcrumb-current-label">Subscriber:</span>{' '}
-              <span className="mono">{selectedImsi}</span>
-            </span>
-          </li>
-        </ol>
-      </nav>
-    )
-  }
-
   return (
-    <nav className="table-breadcrumb table-breadcrumb--compact" aria-label="Cell context">
+    <nav className="table-breadcrumb table-breadcrumb--compact" aria-label="Subscriber context">
       <ol className="table-breadcrumb-list">
         <li className="table-breadcrumb-item">
-          <button type="button" className="table-breadcrumb-back" onClick={onToCells} aria-label="Back to cells">
+          <button type="button" className="table-breadcrumb-back" onClick={onBackToCells} aria-label="Back to cell list">
             ←
           </button>
         </li>
-        {selectedCellId && subscriberListTabLabel && subscriberListCellName ? (
-          <li className="table-breadcrumb-item">
-            <span
-              className="table-breadcrumb-current table-breadcrumb-current--cell-drill"
-              aria-current="page"
-            >
-              <span className="table-breadcrumb-current-label">
-                {subscriberListTabLabel}/Cell:
-              </span>{' '}
-              <span className="table-breadcrumb-cell-name">{subscriberListCellName}</span>
-            </span>
-          </li>
-        ) : selectedCellId ? (
-          <li className="table-breadcrumb-item">
-            <span className="table-breadcrumb-current" aria-current="page">
-              <span className="table-breadcrumb-current-label">Cell:</span>{' '}
-              <span className="mono">{cellIdShort}</span>
-            </span>
-          </li>
-        ) : null}
+        <li className="table-breadcrumb-item">
+          <span className="table-breadcrumb-current" aria-current="page">
+            <span className="table-breadcrumb-current-label">Subscriber:</span>{' '}
+            <span className="mono">{selectedImsi}</span>
+          </span>
+        </li>
       </ol>
     </nav>
   )
@@ -550,7 +394,6 @@ export function OperatorDashboard() {
   }, [filterPresets])
 
   const [view, setView] = useState<View>('cells')
-  const [selectedCellId, setSelectedCellId] = useState<string | null>(null)
   const [selectedImsi, setSelectedImsi] = useState<string | null>(null)
   /** STATE 3: filter session table to one cell (map click); cleared on background click or navigation. */
   const [sessionCellFilter, setSessionCellFilter] = useState<string | null>(null)
@@ -561,11 +404,55 @@ export function OperatorDashboard() {
   /** Open slide-over session inspector (plain row click); cleared on nav / multi-select / backdrop. */
   const [sessionDetailPaneId, setSessionDetailPaneId] = useState<string | null>(null)
   const [tableImsiSearch, setTableImsiSearch] = useState('')
+  const [leaderboardListMode, setLeaderboardListMode] = useState<LeaderboardListMode>('impacted-subscribers')
+  const [impactType, setImpactType] = useState<LeaderboardImpactLens>(
+    () => impactTypeFromKpiId(DEFAULT_GLOBAL_FILTER_SNAPSHOT.selectedKpiId) ?? 'All',
+  )
 
   const [comparePeriodB, setComparePeriodB] = useState<ComparePeriodOption>('7d')
   const [customRangeStart, setCustomRangeStart] = useState('')
   const [customRangeEnd, setCustomRangeEnd] = useState('')
   const [showComparisonCdf, setShowComparisonCdf] = useState(false)
+  const aiChatRef = useRef<AiChatDockHandle>(null)
+
+  const handleAiExplainRow = useCallback(
+    (detail: ImpactLeaderboardAiExplainDetail) => {
+      const cell = cellById(detail.cellId) ?? null
+      const timeLabel =
+        timeRange === 'custom' && customTimeRangeStart && customTimeRangeEnd
+          ? `${customTimeRangeStart} → ${customTimeRangeEnd}`
+          : globalTimeRangeLabel(timeRange)
+      const geoBits: string[] = []
+      if (selectedRegionIds.length) geoBits.push(`${selectedRegionIds.length} region(s)`)
+      if (selectedPostcodeAreaIds.length) geoBits.push(`${selectedPostcodeAreaIds.length} postcode area(s)`)
+      const filterSummary = [
+        `time ${timeLabel}`,
+        `service ${service}`,
+        `subscriber type ${subscriberType}`,
+        `mode ${networkMode}`,
+        geoBits.length ? `geo ${geoBits.join(', ')}` : 'geo all',
+      ].join(' · ')
+
+      const userText = buildImpactRowExplainUserText(detail)
+      aiChatRef.current?.openWithContext({
+        userText,
+        assistantBody: (
+          <RowInsightCard detail={detail} filterSummary={filterSummary} cell={cell} />
+        ),
+        replaceMapInsight: false,
+      })
+    },
+    [
+      customTimeRangeEnd,
+      customTimeRangeStart,
+      networkMode,
+      selectedPostcodeAreaIds,
+      selectedRegionIds,
+      service,
+      subscriberType,
+      timeRange,
+    ],
+  )
 
   const subscriberGlobalFilters: SubscriberGlobalFilters = useMemo(
     () => ({
@@ -590,66 +477,94 @@ export function OperatorDashboard() {
     ],
   )
 
-  const ranked = useMemo(
-    () => rankedCellsByKpi(selectedKpiId, subscriberGlobalFilters),
-    [selectedKpiId, subscriberGlobalFilters],
-  )
-
   useEffect(() => {
     const geo = unionCellIdsForGeoSelection(selectedRegionIds, selectedPostcodeAreaIds)
     if (geo === null) return
-    if (selectedCellId && !geo.has(selectedCellId)) {
-      setSelectedCellId(null)
-      setSelectedImsi(null)
-      setTableImsiSearch('')
-      setSessionCellFilter(null)
-      setSelectedSessionIds([])
-      setSessionSelectionAnchorId(null)
-      setSessionDetailPaneId(null)
-      setView('cells')
-    }
-    if (selectedImsi) {
-      const anchor = SUBSCRIBERS.find((s) => s.imsi === selectedImsi)?.cellId
-      if (anchor && !geo.has(anchor)) {
-        setSelectedImsi(null)
-        setTableImsiSearch('')
-        setSessionCellFilter(null)
-        setSelectedSessionIds([])
-        setSessionSelectionAnchorId(null)
-        setSessionDetailPaneId(null)
-        setView('cells')
+    queueMicrotask(() => {
+      if (selectedImsi) {
+        const anchor = SUBSCRIBERS.find((s) => s.imsi === selectedImsi)?.cellId
+        if (anchor && !geo.has(anchor)) {
+          setSelectedImsi(null)
+          setTableImsiSearch('')
+          setSessionCellFilter(null)
+          setSelectedSessionIds([])
+          setSessionSelectionAnchorId(null)
+          setSessionDetailPaneId(null)
+          setView('cells')
+        }
       }
+    })
+  }, [selectedRegionIds, selectedPostcodeAreaIds, selectedImsi])
+
+  const cellsForLeaderboard = useMemo(() => {
+    const geo = unionCellIdsForGeoSelection(selectedRegionIds, selectedPostcodeAreaIds)
+    let list = geo ? CELLS.filter((c) => geo.has(c.id)) : [...CELLS]
+    const qAttr = cellAttributes.trim().toLowerCase()
+    if (qAttr) {
+      list = list.filter((c) => c.name.toLowerCase().includes(qAttr) || c.id.toLowerCase().includes(qAttr))
     }
-  }, [selectedRegionIds, selectedPostcodeAreaIds, selectedCellId, selectedImsi])
+    const qSearch = tableImsiSearch.trim().toLowerCase()
+    if (qSearch) {
+      list = list.filter((c) => c.name.toLowerCase().includes(qSearch) || c.id.toLowerCase().includes(qSearch))
+    }
+    return list
+  }, [selectedRegionIds, selectedPostcodeAreaIds, cellAttributes, tableImsiSearch])
 
-  const visibleRanked = useMemo(() => {
-    const q = cellAttributes.trim().toLowerCase()
-    if (!q) return ranked
-    return ranked.filter(
-      (c) => c.name.toLowerCase().includes(q) || c.id.toLowerCase().includes(q),
-    )
-  }, [ranked, cellAttributes])
-
-  const footprintSubscribers = useMemo(() => {
-    if (!selectedCellId) return []
-    const base = subscribersForFootprint(selectedCellId)
-    return applyGlobalSubscriberFilters(base, subscriberGlobalFilters)
-  }, [selectedCellId, subscriberGlobalFilters])
-
-  const subscriberRows = useMemo(() => {
-    let rows = footprintSubscribers
-    if (tableImsiSearch.trim())
-      rows = rows.filter((s) => matchImsi(tableImsiSearch, s.imsi))
-    return sortSubscribersByKpi(rows, selectedKpiId)
-  }, [footprintSubscribers, selectedKpiId, tableImsiSearch])
+  const impactLeaderboardRows = useMemo(() => {
+    const enriched = cellsForLeaderboard.map((cell) => {
+      const counts = cellImpactSubscriberCounts(cell, subscriberGlobalFilters, impactType)
+      const flags = cellLeaderboardTrailFlags(cell, subscriberGlobalFilters, impactType)
+      let worstMetricLine: string | null = null
+      if (leaderboardListMode === 'worst-cells') {
+        if (impactType === 'All') {
+          worstMetricLine = 'Mean rank across pillars (connectivity, reliability, signal, throughput)'
+        } else {
+          const pillar: ImpactType = impactType
+          const kpiId = IMPACT_TYPE_DEFAULT_KPI[pillar]
+          worstMetricLine = `${KPI_BY_ID[kpiId].label}: ${formatKpiValue(
+            kpiId,
+            cellKpiValue(cell, subscriberGlobalFilters, kpiId),
+          )}`
+        }
+      }
+      return { cell, ...counts, flags, worstMetricLine }
+    })
+    if (leaderboardListMode === 'impacted-subscribers') {
+      enriched.sort((a, b) => b.affected - a.affected || b.total - a.total)
+      return enriched
+    }
+    const idSet = new Set(cellsForLeaderboard.map((c) => c.id))
+    const worstOrder =
+      impactType === 'All'
+        ? (() => {
+            const rankMaps = IMPACT_TYPES_ORDER.map((p) => {
+              const order = rankedCellsByKpi(IMPACT_TYPE_DEFAULT_KPI[p], subscriberGlobalFilters)
+              return new Map(order.map((c, i) => [c.id, i]))
+            })
+            const meanRank = (cellId: string) =>
+              rankMaps.reduce((sum, m) => sum + (m.get(cellId) ?? 99999), 0) / rankMaps.length
+            return [...cellsForLeaderboard].sort((a, b) => meanRank(a.id) - meanRank(b.id))
+          })()
+        : rankedCellsByKpi(IMPACT_TYPE_DEFAULT_KPI[impactType], subscriberGlobalFilters).filter((c) =>
+            idSet.has(c.id),
+          )
+    const idx = new Map(worstOrder.map((c, i) => [c.id, i]))
+    enriched.sort((a, b) => (idx.get(a.cell.id) ?? 9999) - (idx.get(b.cell.id) ?? 9999))
+    return enriched
+  }, [cellsForLeaderboard, subscriberGlobalFilters, impactType, leaderboardListMode])
 
   const imsiQuickMatches = useMemo(() => {
     const q = tableImsiSearch.trim()
     if (!q) return []
-    return applyGlobalSubscriberFilters(SUBSCRIBERS, subscriberGlobalFilters)
-      .filter((s) => matchImsi(q, s.imsi))
-      .slice(0, 8)
-  }, [tableImsiSearch, subscriberGlobalFilters])
+    const matches = applyGlobalSubscriberFilters(SUBSCRIBERS, subscriberGlobalFilters).filter((s) =>
+      matchImsi(q, s.imsi),
+    )
+    const ordered =
+      subscriberType === 'all'
+        ? sortSubscribersByKpiMixedSegments(matches, selectedKpiId)
+        : sortSubscribersByKpi(matches, selectedKpiId)
+    return ordered.slice(0, 8)
+  }, [tableImsiSearch, subscriberGlobalFilters, subscriberType, selectedKpiId])
 
   const allSessionsForSubscriber = useMemo(
     () => (selectedImsi ? getSessions(selectedImsi, subscriberGlobalFilters) : []),
@@ -672,7 +587,9 @@ export function OperatorDashboard() {
   }, [view, sessions, showAllSessions])
 
   useEffect(() => {
-    setShowAllSessions(false)
+    queueMicrotask(() => {
+      setShowAllSessions(false)
+    })
   }, [selectedImsi, sessionCellFilter])
 
   const sessionDetailPaneSession = useMemo(() => {
@@ -682,7 +599,9 @@ export function OperatorDashboard() {
 
   useEffect(() => {
     if (sessionDetailPaneId && !sessionsDisplay.some((s) => s.id === sessionDetailPaneId)) {
-      setSessionDetailPaneId(null)
+      queueMicrotask(() => {
+        setSessionDetailPaneId(null)
+      })
     }
   }, [sessionsDisplay, sessionDetailPaneId])
 
@@ -695,21 +614,12 @@ export function OperatorDashboard() {
     return () => window.removeEventListener('keydown', onKey)
   }, [sessionDetailPaneId])
 
-  const cellFocusSessions = useMemo(() => {
-    if (view !== 'subscribers' || !selectedCellId) return []
-    return footprintSubscribers.flatMap((subscriber) =>
-      getSessions(subscriber.imsi, subscriberGlobalFilters),
-    )
-  }, [view, selectedCellId, footprintSubscribers, subscriberGlobalFilters])
-
   const isSubscriberSessionView = view === 'sessions' && !!selectedImsi
-  const isCellFocusView = view === 'subscribers' && !!selectedCellId
 
   const analyticsSessions = useMemo(() => {
-    if (isSubscriberSessionView) return sessionsDisplay
-    if (isCellFocusView) return cellFocusSessions
-    return []
-  }, [isSubscriberSessionView, isCellFocusView, sessionsDisplay, cellFocusSessions])
+    if (!isSubscriberSessionView) return []
+    return sessionsDisplay
+  }, [isSubscriberSessionView, sessionsDisplay])
 
   const peerTrendByIndex = useMemo(() => {
     const bucketCount = analyticsSessions.length
@@ -772,27 +682,6 @@ export function OperatorDashboard() {
   ])
 
   const trendData = useMemo<TrendDatum[]>(() => {
-    if (isCellFocusView) {
-      return bucketSessionsForTrend(analyticsSessions, CELL_FOCUS_TREND_BUCKETS).map((bucket) => ({
-        i: bucket.i,
-        tp: bucket.avgThroughput,
-        id: null,
-        cellId: null,
-        cellName: null,
-        peerBackdrop: null,
-        peerAvg: null,
-        peerLow: null,
-        peerHigh: null,
-        peerCount: 0,
-        bucketSize: bucket.bucketSize,
-        bucketCellCount: bucket.cellCount,
-        p10: bucket.p10Throughput,
-        p90: bucket.p90Throughput,
-        low: bucket.lowThroughput,
-        high: bucket.highThroughput,
-        isAggregated: true,
-      }))
-    }
     return analyticsSessions.map((s, i) => {
       const peer = peerTrendByIndex.get(i)
       return {
@@ -815,14 +704,8 @@ export function OperatorDashboard() {
         isAggregated: false,
       }
     })
-  }, [analyticsSessions, isCellFocusView, peerTrendByIndex])
-  const scatterSourceSessions = useMemo(
-    () =>
-      isCellFocusView
-        ? deterministicSample(analyticsSessions, CELL_FOCUS_SCATTER_MAX_POINTS)
-        : analyticsSessions,
-    [analyticsSessions, isCellFocusView],
-  )
+  }, [analyticsSessions, peerTrendByIndex])
+  const scatterSourceSessions = useMemo(() => analyticsSessions, [analyticsSessions])
   const scatterData = useMemo(
     () => scatterSourceSessions.map((s) => ({ x: s.signalQuality, y: s.throughputMbps, id: s.id })),
     [scatterSourceSessions],
@@ -840,8 +723,8 @@ export function OperatorDashboard() {
     [visibleSelectedSessionIds],
   )
   const selectedTrendPoints = useMemo(
-    () => (isCellFocusView ? [] : trendData.filter((d) => d.id && selectedSessionIdSet.has(d.id))),
-    [isCellFocusView, trendData, selectedSessionIdSet],
+    () => trendData.filter((d) => d.id && selectedSessionIdSet.has(d.id)),
+    [trendData, selectedSessionIdSet],
   )
   const trendSessionBands = useMemo(
     () => {
@@ -860,17 +743,11 @@ export function OperatorDashboard() {
     [trendData],
   )
   const selectedScatterPoints = useMemo(
-    () => (isCellFocusView ? [] : scatterData.filter((d) => selectedSessionIdSet.has(d.id))),
-    [isCellFocusView, scatterData, selectedSessionIdSet],
+    () => scatterData.filter((d) => selectedSessionIdSet.has(d.id)),
+    [scatterData, selectedSessionIdSet],
   )
 
-  const comparisonSourceSessions = useMemo(
-    () =>
-      isCellFocusView
-        ? deterministicSample(analyticsSessions, CELL_FOCUS_COMPARISON_MAX_SESSIONS)
-        : analyticsSessions,
-    [analyticsSessions, isCellFocusView],
-  )
+  const comparisonSourceSessions = useMemo(() => analyticsSessions, [analyticsSessions])
 
   const comparisonDistributionData = useMemo(() => {
     if (!comparisonSourceSessions.length) return []
@@ -920,9 +797,41 @@ export function OperatorDashboard() {
       return
     }
     setSessionCellFilter(null)
-    setSelectedCellId(cellId)
     setSelectedImsi(null)
-    setView('subscribers')
+    const cell = cellById(cellId)
+    if (!cell) return
+    const filters = subscriberGlobalFilters
+    const lens = impactType
+    void (async () => {
+      aiChatRef.current?.setInsightLoading(true)
+      try {
+        const env = cellEnvironmentLabel(cell)
+        const { affected, total } = cellImpactSubscriberCounts(cell, filters, lens)
+        const payload = await fetchMapCellInsight({
+          cell,
+          filters,
+          lensImpactType: lens,
+          affected,
+          total,
+          environment: env,
+        })
+        aiChatRef.current?.openWithContext({
+          userText: payload.userText,
+          assistantText: payload.assistantText,
+          assistantDiagram: payload.diagram,
+          replaceMapInsight: true,
+          source: 'map-click',
+        })
+      } catch {
+        aiChatRef.current?.openWithContext({
+          assistantText: 'Could not load insight for this map selection. Try again.',
+          replaceMapInsight: true,
+          source: 'map-click',
+        })
+      } finally {
+        aiChatRef.current?.setInsightLoading(false)
+      }
+    })()
   }
 
   function handleMapBackgroundClick() {
@@ -935,49 +844,24 @@ export function OperatorDashboard() {
   }
 
   function selectCellFromTable(cellId: string) {
-    setSelectedCellId(cellId)
-    setSelectedImsi(null)
     setTableImsiSearch('')
-    setSessionCellFilter(null)
     setSelectedSessionIds([])
     setSessionSelectionAnchorId(null)
     setSessionDetailPaneId(null)
-    setView('subscribers')
+    handleMapCellSelect(cellId)
   }
 
   function backToCells() {
     setView('cells')
-    setSelectedCellId(null)
     setSelectedImsi(null)
     setSessionCellFilter(null)
     setSelectedSessionIds([])
     setSessionSelectionAnchorId(null)
     setSessionDetailPaneId(null)
     setTableImsiSearch('')
-  }
-
-  function backToSubscribers() {
-    setView('subscribers')
-    setSelectedImsi(null)
-    setTableImsiSearch('')
-    setSessionCellFilter(null)
-    setSelectedSessionIds([])
-    setSessionSelectionAnchorId(null)
-    setSessionDetailPaneId(null)
-  }
-
-  function openSubscriber(imsi: string) {
-    setSelectedImsi(imsi)
-    setTableImsiSearch('')
-    setSessionCellFilter(null)
-    setSelectedSessionIds([])
-    setSessionSelectionAnchorId(null)
-    setSessionDetailPaneId(null)
-    setView('sessions')
   }
 
   function openSubscriberFromGlobal(imsi: string) {
-    setSelectedCellId(null)
     setSelectedImsi(imsi)
     setTableImsiSearch('')
     setSessionCellFilter(null)
@@ -1025,13 +909,8 @@ export function OperatorDashboard() {
     setSessionSelectionAnchorId(sessionId)
   }
 
-  const mapMode =
-    view === 'sessions' && selectedImsi
-      ? 'subscriberFocus'
-      : view === 'subscribers' && selectedCellId
-        ? 'cellFocus'
-        : 'all'
-  const showAnalytics = isSubscriberSessionView || isCellFocusView
+  const mapMode = view === 'sessions' && selectedImsi ? 'subscriberFocus' : 'all'
+  const showAnalytics = isSubscriberSessionView
   const selectedKpiMeta = KPI_BY_ID[selectedKpiId]
   const showSessionInspector = Boolean(
     view === 'sessions' && selectedImsi && sessionDetailPaneSession && sessionDetailPaneId,
@@ -1092,6 +971,19 @@ export function OperatorDashboard() {
     setFilterPresets((prev) => prev.filter((p) => p.id !== id))
   }
 
+  function handleSelectedKpiIdChange(next: KpiId) {
+    setSelectedKpiId(next)
+    const it = impactTypeFromKpiId(next)
+    setImpactType(it ?? 'All')
+  }
+
+  function handleImpactTypeChange(next: LeaderboardImpactLens) {
+    setImpactType(next)
+    if (next !== 'All') {
+      setSelectedKpiId(IMPACT_TYPE_DEFAULT_KPI[next])
+    }
+  }
+
   return (
     <div className="operator-app">
       <DashboardTopHeader />
@@ -1115,7 +1007,7 @@ export function OperatorDashboard() {
         selectedPostcodeAreaIds={selectedPostcodeAreaIds}
         onSelectedPostcodeAreaIds={setSelectedPostcodeAreaIds}
         selectedKpiId={selectedKpiId}
-        onSelectedKpiId={setSelectedKpiId}
+        onSelectedKpiId={handleSelectedKpiIdChange}
         presets={filterPresets}
         onApplyPreset={handleApplyPreset}
         onSavePreset={handleSavePreset}
@@ -1126,109 +1018,42 @@ export function OperatorDashboard() {
         <section className="pane table-pane">
           <div className="table-stack">
             {view === 'cells' ? (
-              <label className="imsi-search">
-                <input
-                  type="search"
-                  aria-label="Search cells and subscribers"
-                  placeholder="Search cells or subscribers…"
-                  value={tableImsiSearch}
-                  onChange={(e) => setTableImsiSearch(e.target.value)}
-                />
-              </label>
+              <>
+                <div className="table-scroll table-scroll--impact-leaderboard">
+                  <ImpactLeaderboard
+                    listMode={leaderboardListMode}
+                    onListMode={setLeaderboardListMode}
+                    impactType={impactType}
+                    onImpactType={handleImpactTypeChange}
+                    search={tableImsiSearch}
+                    onSearch={setTableImsiSearch}
+                    rows={impactLeaderboardRows}
+                    onSelectCell={selectCellFromTable}
+                    onAiExplainRow={handleAiExplainRow}
+                  />
+                </div>
+                {leaderboardListMode === 'impacted-subscribers' &&
+                tableImsiSearch.trim() &&
+                imsiQuickMatches.length > 0 ? (
+                  <div className="quick-matches">
+                    <span className="quick-matches-label">Matching subscribers (open session view)</span>
+                    <ul>
+                      {imsiQuickMatches.map((s) => (
+                        <li key={s.imsi}>
+                          <button type="button" onClick={() => openSubscriberFromGlobal(s.imsi)}>
+                            {s.imsi}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+              </>
             ) : null}
 
-            {view === 'cells' && tableImsiSearch.trim() && imsiQuickMatches.length > 0 && (
-              <div className="quick-matches">
-                <span className="quick-matches-label">Matching subscribers (open session view)</span>
-                <ul>
-                  {imsiQuickMatches.map((s) => (
-                    <li key={s.imsi}>
-                      <button type="button" onClick={() => openSubscriberFromGlobal(s.imsi)}>
-                        {s.imsi}
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-
-            {view === 'subscribers' && selectedCellId ? (() => {
-              const selectedCell = cellById(selectedCellId)
-              if (!selectedCell) return null
-              return (
-                <>
-                  <TableNavBreadcrumb
-                    view="subscribers"
-                    selectedCellId={selectedCellId}
-                    selectedImsi={null}
-                    subscriberListTabLabel="Cells"
-                    subscriberListCellName={selectedCell.name}
-                    onToCells={backToCells}
-                    onToSubscribers={backToSubscribers}
-                  />
-                  <div className="cell-session-profile">
-                    <CellDetailsPanel cell={selectedCell} showTitle={false} />
-                  </div>
-                </>
-              )
-            })() : null}
-            {view === 'sessions' && selectedImsi && (
-              <TableNavBreadcrumb
-                view="sessions"
-                selectedCellId={selectedCellId}
-                selectedImsi={selectedImsi}
-                onToCells={backToCells}
-                onToSubscribers={backToSubscribers}
-              />
-            )}
-
-            {view === 'cells' && (
-              <>
-                <div className="table-scroll">
-                  <table className="minimal-table">
-                    <thead>
-                      <tr>
-                        <th>Cell name</th>
-                        <th>{selectedKpiMeta.label}</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {visibleRanked.map((c) => (
-                        <tr key={c.id} onClick={() => selectCellFromTable(c.id)}>
-                          <td>{c.name}</td>
-                          <td>{formatKpiValue(selectedKpiId, cellKpiValue(c, subscriberGlobalFilters, selectedKpiId))}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </>
-            )}
-
-            {view === 'subscribers' && selectedCellId && (
-              <>
-                <div className="table-scroll">
-                  <table className="minimal-table">
-                    <thead>
-                      <tr>
-                        <th>Subscriber</th>
-                        <th>Sessions</th>
-                        <th>{selectedKpiMeta.label}</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {subscriberRows.map((s) => (
-                        <tr key={s.imsi} onClick={() => openSubscriber(s.imsi)}>
-                          <td className="mono">{s.imsi}</td>
-                          <td>{s.sessions}</td>
-                          <td>{formatKpiValue(selectedKpiId, subscriberKpiValue(s, selectedKpiId))}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </>
-            )}
+            {view === 'sessions' && selectedImsi ? (
+              <SessionTableBreadcrumb selectedImsi={selectedImsi} onBackToCells={backToCells} />
+            ) : null}
 
             {view === 'sessions' && selectedImsi && (
               <>
@@ -1323,29 +1148,32 @@ export function OperatorDashboard() {
         >
           <div className="detail-stack">
             <div className="detail-map-slot">
-              <OperatorMap
-                mode={mapMode}
-                selectedCellId={selectedCellId}
-                subscriberImsi={selectedImsi}
-                selectedKpiId={selectedKpiId}
-                sessions={sessionsDisplay}
-                selectedSessionIds={visibleSelectedSessionIds}
-                onSessionSelect={selectSingleSession}
-                sessionTableCellFilter={sessionCellFilter}
-                showHoverKpis={view === 'sessions'}
-                embed={showAnalytics ? 'compact' : 'full'}
-                subscriberGlobalFilters={subscriberGlobalFilters}
-                onCellSelect={handleMapCellSelect}
-                onMapBackgroundClick={handleMapBackgroundClick}
-              />
+              <div className="detail-map-slot__stack">
+                <div className="detail-map-slot__map">
+                  <OperatorMap
+                    mode={mapMode}
+                    selectedCellId={null}
+                    subscriberImsi={selectedImsi}
+                    selectedKpiId={selectedKpiId}
+                    sessions={sessionsDisplay}
+                    selectedSessionIds={visibleSelectedSessionIds}
+                    onSessionSelect={selectSingleSession}
+                    sessionTableCellFilter={sessionCellFilter}
+                    showHoverKpis={view === 'sessions'}
+                    embed={showAnalytics ? 'compact' : 'full'}
+                    subscriberGlobalFilters={subscriberGlobalFilters}
+                    onCellSelect={handleMapCellSelect}
+                    onMapBackgroundClick={handleMapBackgroundClick}
+                  />
+                </div>
+                <AiChatDock ref={aiChatRef} />
+              </div>
             </div>
 
             {showAnalytics && (
               <div className="session-analytics-scroll">
                 <div className="charts-block">
-                  <h3 className="block-title">
-                    {isCellFocusView ? 'Cell footprint charts' : 'Session charts'}
-                  </h3>
+                  <h3 className="block-title">Session charts</h3>
                   <div className="chart-grid">
                     <figure className="chart-fig">
                       <figcaption>Throughput trend</figcaption>
@@ -1385,22 +1213,6 @@ export function OperatorDashboard() {
                             content={({ active, payload }) => {
                               if (!active || !payload?.[0]) return null
                               const d = payload[0].payload as (typeof trendData)[number]
-                              if (d.isAggregated) {
-                                return (
-                                  <div className="chart-tooltip">
-                                    <div className="chart-tooltip-title">Bucket {d.i + 1}</div>
-                                    <div className="chart-tooltip-sub">
-                                      {d.bucketSize} sessions across {d.bucketCellCount} cells
-                                    </div>
-                                    <div className="chart-tooltip-kpi">
-                                      Avg throughput: <strong>{d.tp.toFixed(1)} Mbps</strong>
-                                    </div>
-                                    <div className="chart-tooltip-kpi">
-                                      P10-P90: {d.p10.toFixed(1)}-{d.p90.toFixed(1)} Mbps
-                                    </div>
-                                  </div>
-                                )
-                              }
                               return (
                                 <div className="chart-tooltip">
                                   <div className="chart-tooltip-title">Session {d.i + 1}</div>
@@ -1408,48 +1220,42 @@ export function OperatorDashboard() {
                                     {d.id} · {d.cellName} ({d.cellId})
                                   </div>
                                   <div className="chart-tooltip-kpi">
-                                    {isCellFocusView ? 'Cell footprint' : 'Selected subscriber'}:{' '}
-                                    <strong>{d.tp.toFixed(1)} Mbps</strong>
+                                    Selected subscriber: <strong>{d.tp.toFixed(1)} Mbps</strong>
                                   </div>
-                                  {!isCellFocusView &&
-                                  d.peerAvg !== null &&
-                                  d.peerLow !== null &&
-                                  d.peerHigh !== null ? (
+                                  {d.peerAvg !== null && d.peerLow !== null && d.peerHigh !== null ? (
                                     <div className="chart-tooltip-kpi">
                                       Peers ({d.peerCount}): {d.peerAvg.toFixed(1)} avg ·{' '}
                                       {d.peerLow.toFixed(1)}-{d.peerHigh.toFixed(1)} Mbps
                                     </div>
-                                  ) : !isCellFocusView ? (
+                                  ) : (
                                     <div className="chart-tooltip-kpi">Peers: no data</div>
-                                  ) : null}
+                                  )}
                                 </div>
                               )
                             }}
                           />
-                          {!isCellFocusView && (
-                            <>
-                              <Area
-                                type="monotone"
-                                dataKey="peerBackdrop"
-                                stroke="none"
-                                fill="#93c5fd"
-                                fillOpacity={0.22}
-                                isAnimationActive={false}
-                                connectNulls
-                              />
-                              <Line
-                                type="monotone"
-                                dataKey="peerAvg"
-                                stroke="#93c5fd"
-                                strokeWidth={1.5}
-                                dot={false}
-                                strokeDasharray="4 4"
-                                strokeOpacity={0.75}
-                                isAnimationActive={false}
-                                connectNulls
-                              />
-                            </>
-                          )}
+                          <>
+                            <Area
+                              type="monotone"
+                              dataKey="peerBackdrop"
+                              stroke="none"
+                              fill="#93c5fd"
+                              fillOpacity={0.22}
+                              isAnimationActive={false}
+                              connectNulls
+                            />
+                            <Line
+                              type="monotone"
+                              dataKey="peerAvg"
+                              stroke="#93c5fd"
+                              strokeWidth={1.5}
+                              dot={false}
+                              strokeDasharray="4 4"
+                              strokeOpacity={0.75}
+                              isAnimationActive={false}
+                              connectNulls
+                            />
+                          </>
                           {selectedTrendPoints.map((point) => (
                             <Fragment key={point.id}>
                               <ReferenceArea
